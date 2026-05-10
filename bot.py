@@ -4,7 +4,7 @@ from urllib.parse import urlparse
 import pg8000.dbapi
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes, Application
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import threading
 import os
 import re
@@ -17,10 +17,21 @@ logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 DB_URL = os.environ.get("DATABASE_URL")
 
+try:
+    MY_CHAT_ID = int(os.environ.get("MY_CHAT_ID", "0"))
+except ValueError:
+    MY_CHAT_ID = 0
+
 FEEDBACK_SIG = "\n\n*(Suggestion are accepted send the suggestions to @Acchoro)*"
 # -----------------------------------------------
 
 MEDIA_GROUP_CAPTIONS = {}
+
+# --- NEW: MARKDOWN SANITIZER ---
+def safe_md(text):
+    """Prevents Telegram from crashing when users have underscores in their names."""
+    if not text: return ""
+    return str(text).replace("_", "\\_").replace("*", "\\*").replace("`", "")
 
 def get_db_connection():
     url = urlparse(DB_URL)
@@ -58,6 +69,9 @@ def upgrade_database_schema():
                 registered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         ''')
+        cursor.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS tg_username TEXT;")
+        cursor.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS tg_name TEXT;")
+        
         conn.commit()
     except Exception as e:
         print(f"Database setup error: {e}")
@@ -78,6 +92,7 @@ def auto_clean_trash():
         conn.close()
 
 def is_registered(user_id):
+    if user_id == MY_CHAT_ID: return True 
     conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute("SELECT full_name FROM users WHERE user_id = %s", (user_id,))
@@ -86,10 +101,23 @@ def is_registered(user_id):
     conn.close()
     return row is not None
 
-def register_user(user_id, full_name):
+def register_user(user_id, full_name, tg_username=None, tg_name=None):
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("INSERT INTO users (user_id, full_name) VALUES (%s, %s) ON CONFLICT (user_id) DO NOTHING", (user_id, full_name))
+    cursor.execute('''
+        INSERT INTO users (user_id, full_name, tg_username, tg_name) 
+        VALUES (%s, %s, %s, %s) 
+        ON CONFLICT (user_id) DO UPDATE SET tg_username = EXCLUDED.tg_username, tg_name = EXCLUDED.tg_name
+    ''', (user_id, full_name, tg_username, tg_name))
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+def update_user_tg_info(user_id, tg_username, tg_name):
+    if user_id == MY_CHAT_ID: return
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("UPDATE users SET tg_username = %s, tg_name = %s WHERE user_id = %s", (tg_username, tg_name, user_id))
     conn.commit()
     cursor.close()
     conn.close()
@@ -123,13 +151,18 @@ def format_bytes(size):
 class DummyHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
-        self.send_header('Content-type', 'text/plain')
+        self.send_header('Content-type', 'text/html')
         self.end_headers()
-        self.wfile.write(b"Family Cloud is awake!")
+        self.wfile.write(b"<html><body><h1>Cloudyfy Engine Active</h1></body></html>")
+        
+    def do_HEAD(self):
+        self.send_response(200)
+        self.send_header('Content-type', 'text/html')
+        self.end_headers()
 
 def run_dummy_server():
     port = int(os.environ.get("PORT", 8080))
-    server = HTTPServer(('0.0.0.0', port), DummyHandler)
+    server = ThreadingHTTPServer(('0.0.0.0', port), DummyHandler)
     server.serve_forever()
 
 async def post_init(application: Application):
@@ -146,6 +179,8 @@ def get_main_menu(user_id):
         [InlineKeyboardButton("📅 Search by Time ➡️", callback_data='menu_dates')],
         [InlineKeyboardButton("🗑️ Recycle Bin (Trash) ➡️", callback_data='menu_trash')]
     ]
+    if user_id == MY_CHAT_ID:
+        keyboard.append([InlineKeyboardButton("🌐", callback_data='menu_users')])
     return InlineKeyboardMarkup(keyboard)
 
 def get_categories_menu(user_id):
@@ -157,6 +192,19 @@ def get_categories_menu(user_id):
         [InlineKeyboardButton("📱 APKs", callback_data='p_ct_1_APK'),
          InlineKeyboardButton("📄 Others", callback_data='p_ct_1_Other')],
         [InlineKeyboardButton("⬅️ Back to Main", callback_data='menu_main')]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+def get_admin_user_categories_menu(target_uid):
+    keyboard = [
+        [InlineKeyboardButton("🕒 Recent Uploads", callback_data=f'p_ur_1_none:{target_uid}')],
+        [InlineKeyboardButton("🎥 Videos", callback_data=f'p_uc_1_Video:{target_uid}'),
+         InlineKeyboardButton("📸 Images", callback_data=f'p_uc_1_Image:{target_uid}')],
+        [InlineKeyboardButton("🎵 Audio", callback_data=f'p_uc_1_Audio:{target_uid}'),
+         InlineKeyboardButton("📦 ZIPs", callback_data=f'p_uc_1_ZIP:{target_uid}')],
+        [InlineKeyboardButton("📄 Others", callback_data=f'p_uc_1_Other:{target_uid}')],
+        [InlineKeyboardButton("🗂️ View Hashtag Folders", callback_data=f'menu_user_folders_{target_uid}')],
+        [InlineKeyboardButton("⬅️ Back to Users", callback_data='menu_users')]
     ]
     return InlineKeyboardMarkup(keyboard)
 
@@ -218,7 +266,8 @@ def get_paginated_results(f_type, f_param, page, user_id):
     limit = 11 
     offset = (page - 1) * 10 
     
-    auth_filter = f" AND owner_id = {user_id}"
+    target_owner = user_id
+    auth_filter = f" AND owner_id = {target_owner}"
     is_trash = False
     back_target = 'menu_main'
     header = ""
@@ -248,9 +297,35 @@ def get_paginated_results(f_type, f_param, page, user_id):
         cursor.execute(f"SELECT short_code, file_id, file_name, file_type FROM files WHERE upload_date <= NOW() - INTERVAL '{start_num} {unit}' AND upload_date >= NOW() - INTERVAL '{end_num} {unit}' AND deleted_at IS NULL {auth_filter} ORDER BY upload_date DESC LIMIT %s OFFSET %s", (limit, offset))
         header = f"📅 *{start_num} to {end_num} {unit} ago (Page {page}):*\n\n"
         back_target = 'menu_weeks' if 'w' in f_param else 'menu_months'
+        
+    elif f_type == 'ur': 
+        _, target_uid_str = f_param.split(':')
+        target_owner = int(target_uid_str)
+        if user_id != MY_CHAT_ID: return [], False, "", "", False
+        admin_auth_filter = f" AND owner_id = {target_owner}"
+        cursor.execute(f"SELECT short_code, file_id, file_name, file_type FROM files WHERE deleted_at IS NULL {admin_auth_filter} ORDER BY upload_date DESC LIMIT %s OFFSET %s", (limit, offset))
+        header = f"🕒 *User's Recent Files (Page {page}):*\n\n"
+        back_target = f'menu_user_cats_{target_owner}'
+    elif f_type == 'uc': 
+        cat, target_uid_str = f_param.split(':')
+        target_owner = int(target_uid_str)
+        if user_id != MY_CHAT_ID: return [], False, "", "", False
+        admin_auth_filter = f" AND owner_id = {target_owner}"
+        cursor.execute(f"SELECT short_code, file_id, file_name, file_type FROM files WHERE file_type = %s AND deleted_at IS NULL {admin_auth_filter} ORDER BY upload_date DESC LIMIT %s OFFSET %s", (cat, limit, offset))
+        header = f"📂 *User's {cat}s (Page {page}):*\n\n"
+        back_target = f'menu_user_cats_{target_owner}'
+    elif f_type == 'uh': 
+        tag, target_uid_str = f_param.split(':')
+        target_owner = int(target_uid_str)
+        if user_id != MY_CHAT_ID: return [], False, "", "", False
+        admin_auth_filter = f" AND owner_id = {target_owner}"
+        cursor.execute(f"SELECT short_code, file_id, file_name, file_type FROM files WHERE file_name ILIKE %s AND deleted_at IS NULL {admin_auth_filter} ORDER BY upload_date DESC LIMIT %s OFFSET %s", (f'%#{tag}%', limit, offset))
+        header = f"🗂️ *User's #{tag} (Page {page}):*\n\n"
+        back_target = f'menu_user_folders_{target_owner}'
+
     elif f_type == 'sr':
         cursor.execute(f"SELECT short_code, file_id, file_name, file_type FROM files WHERE file_name ILIKE %s AND deleted_at IS NULL {auth_filter} ORDER BY upload_date DESC LIMIT %s OFFSET %s", (f'%{f_param}%', limit, offset))
-        header = f"🔎 *Search:* `{f_param}` (Page {page})\n\n"
+        header = f"🔎 *Search:* `{safe_md(f_param)}` (Page {page})\n\n"
     elif f_type == 'tr':
         is_trash = True
         cursor.execute(f"SELECT short_code, file_id, file_name, file_type FROM files WHERE deleted_at IS NOT NULL {auth_filter} ORDER BY deleted_at DESC LIMIT %s OFFSET %s", (limit, offset))
@@ -296,7 +371,8 @@ def format_results_msg(results, header, is_trash):
             msg += f"🔗 /share{row[0]} | 🗑️ /del{row[0]}\n\n"
     return msg
 
-def is_authorized_to_modify(short_code, user_id):
+def is_authorized(short_code, user_id):
+    if user_id == MY_CHAT_ID: return True 
     conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute("SELECT owner_id FROM files WHERE short_code = %s", (short_code,))
@@ -338,13 +414,19 @@ async def register_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
         
     full_name = " ".join(context.args)
-    register_user(user_id, full_name)
-    await update.message.reply_text(f"✅ Vault secured! Registered as *{full_name}*.", parse_mode='Markdown')
+    tg_username = update.effective_user.username
+    tg_name = update.effective_user.first_name
+    
+    register_user(user_id, full_name, tg_username, tg_name)
+    await update.message.reply_text(f"✅ Vault secured! Registered as *{safe_md(full_name)}*.", parse_mode='Markdown')
     await show_main_menu_msg(update, user_id)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     auto_clean_trash()
+    
+    if is_registered(user_id):
+        update_user_tg_info(user_id, update.effective_user.username, update.effective_user.first_name)
 
     if context.args and context.args[0].startswith('get'):
         if not is_registered(user_id):
@@ -387,7 +469,7 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_registered(user_id): return
     
     try:
-        auth_filter = f" AND owner_id = {user_id}"
+        auth_filter = "" if user_id == MY_CHAT_ID else f" AND owner_id = {user_id}"
         conn = get_db_connection()
         cursor = conn.cursor()
         
@@ -413,6 +495,49 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"❌ Error: {str(e)}\n\nThe stats math engine threw an error.")
 
+async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != MY_CHAT_ID: return 
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT user_id FROM users")
+    users = cursor.fetchall()
+    cursor.close()
+    conn.close()
+
+    success_count = 0
+
+    if update.message.reply_to_message:
+        for (uid,) in users:
+            try:
+                await context.bot.copy_message(chat_id=uid, from_chat_id=update.message.chat_id, message_id=update.message.reply_to_message.message_id)
+                success_count += 1
+            except Exception: pass
+    else:
+        text = update.message.text or update.message.caption or ""
+        clean_text = text.replace('/broadcast', '').strip()
+        
+        if not clean_text and not update.message.photo and not update.message.video and not update.message.document:
+            await update.message.reply_text("⚠️ *Usage:*\n1. Reply to ANY message/photo/video with `/broadcast`\n2. Or send media and put `/broadcast Your caption`", parse_mode='Markdown')
+            return
+            
+        msg = f"📢 *SYSTEM ANNOUNCEMENT*\n\n{clean_text}" if clean_text else "📢 *SYSTEM ANNOUNCEMENT*"
+        
+        for (uid,) in users:
+            try:
+                if update.message.photo:
+                    await context.bot.send_photo(chat_id=uid, photo=update.message.photo[-1].file_id, caption=msg, parse_mode='Markdown')
+                elif update.message.video:
+                    await context.bot.send_video(chat_id=uid, video=update.message.video.file_id, caption=msg, parse_mode='Markdown')
+                elif update.message.document:
+                    await context.bot.send_document(chat_id=uid, document=update.message.document.file_id, caption=msg, parse_mode='Markdown')
+                else:
+                    await context.bot.send_message(chat_id=uid, text=msg, parse_mode='Markdown')
+                success_count += 1
+            except Exception: pass
+
+    await update.message.reply_text(f"✅ Broadcast successfully sent to {success_count} users.")
+
 # ==========================================
 #     ACTION COMMANDS 
 # ==========================================
@@ -421,7 +546,7 @@ async def share_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         short_code = update.message.text.split()[0].replace('/share', '', 1)
         if not short_code: return
-        if not is_authorized_to_modify(short_code, update.effective_user.id):
+        if not is_authorized(short_code, update.effective_user.id):
             await update.message.reply_text("🚫 Access Denied: You do not own this file.")
             return
         share_link = f"https://t.me/{context.bot.username}?start=get{short_code}"
@@ -434,7 +559,7 @@ async def delete_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not short_code: return
         user_id = update.effective_user.id
         
-        if not is_authorized_to_modify(short_code, user_id):
+        if not is_authorized(short_code, user_id):
             await update.message.reply_text("🚫 Access Denied: You do not own this file.")
             return
 
@@ -455,7 +580,7 @@ async def restore_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not short_code: return
         user_id = update.effective_user.id
         
-        if not is_authorized_to_modify(short_code, user_id):
+        if not is_authorized(short_code, user_id):
             await update.message.reply_text("🚫 Access Denied: You do not own this file.")
             return
 
@@ -476,7 +601,7 @@ async def perm_delete_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not short_code: return
         user_id = update.effective_user.id
         
-        if not is_authorized_to_modify(short_code, user_id):
+        if not is_authorized(short_code, user_id):
             await update.message.reply_text("🚫 Access Denied: You do not own this file.")
             return
 
@@ -497,7 +622,7 @@ async def rename_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if match:
             short_code = match.group(1)
             user_id = update.effective_user.id
-            if not is_authorized_to_modify(short_code, user_id):
+            if not is_authorized(short_code, user_id):
                 await update.message.reply_text("🚫 Access Denied: You do not own this file.")
                 return
 
@@ -518,7 +643,7 @@ async def get_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         short_code = update.message.text.split()[0].replace('/get', '', 1)
         if not short_code: return
-        if not is_authorized_to_modify(short_code, update.effective_user.id): 
+        if not is_authorized(short_code, update.effective_user.id): 
             await update.message.reply_text("🚫 Access Denied: You do not own this file.")
             return
             
@@ -537,7 +662,7 @@ async def view_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         short_code = update.message.text.split()[0].replace('/view', '', 1)
         if not short_code: return
-        if not is_authorized_to_modify(short_code, update.effective_user.id): 
+        if not is_authorized(short_code, update.effective_user.id): 
             await update.message.reply_text("🚫 Access Denied: You do not own this file.")
             return
             
@@ -584,7 +709,7 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("📂 *Trashed Categories:*", reply_markup=get_trash_categories_menu(user_id), parse_mode='Markdown')
         
         elif data == 'trash_empty':
-            auth_filter = f" AND owner_id = {user_id}"
+            auth_filter = "" if user_id == MY_CHAT_ID else f" AND owner_id = {user_id}"
             conn = get_db_connection()
             cursor = conn.cursor()
             cursor.execute(f"DELETE FROM files WHERE deleted_at IS NOT NULL {auth_filter} RETURNING short_code")
@@ -596,7 +721,7 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
         elif data.startswith('del_folder_'):
             tag = data.split('_', 2)[2]
-            auth_filter = f" AND owner_id = {user_id}"
+            auth_filter = "" if user_id == MY_CHAT_ID else f" AND owner_id = {user_id}"
             conn = get_db_connection()
             cursor = conn.cursor()
             cursor.execute(f"UPDATE files SET deleted_at = NOW() WHERE file_name ILIKE %s {auth_filter} RETURNING id", (f'%#{tag}%',))
@@ -605,6 +730,69 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
             cursor.close()
             conn.close()
             await query.edit_message_text(f"🗑️ Moved {count} files from `#{tag}` to Trash.", parse_mode='Markdown', reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back to Folders", callback_data='menu_folders')]]))
+
+        elif data == 'menu_users':
+            if user_id != MY_CHAT_ID: return
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT u.user_id, u.full_name, COUNT(f.id), MAX(f.upload_date)
+                FROM users u JOIN files f ON u.user_id = f.owner_id AND f.deleted_at IS NULL
+                WHERE u.user_id != %s GROUP BY u.user_id, u.full_name HAVING COUNT(f.id) > 0 ORDER BY MAX(f.upload_date) DESC
+            """, (MY_CHAT_ID,))
+            users = cursor.fetchall()
+            cursor.close()
+            conn.close()
+            keyboard = []
+            for uid, name, count, last in users:
+                time_str = last.strftime("%b %d, %H:%M") if last else ""
+                keyboard.append([InlineKeyboardButton(f"👤 {name} | 📁 {count} | 🕒 {time_str}", callback_data=f"menu_user_cats_{uid}")])
+            keyboard.append([InlineKeyboardButton("⬅️ Back to Main", callback_data='menu_main')])
+            await query.edit_message_text("🌐 *Active User Vaults:*", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+            
+        elif data.startswith('menu_user_cats_'):
+            if user_id != MY_CHAT_ID: return
+            target_uid = int(data.split('_')[3])
+            
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            cursor.execute("SELECT full_name, tg_username, tg_name FROM users WHERE user_id = %s", (target_uid,))
+            user_data = cursor.fetchone()
+            cursor.close()
+            conn.close()
+            
+            if user_data:
+                f_name, t_user, t_name = user_data
+                
+                # --- NEW FIX APPLIED HERE ---
+                f_name_safe = safe_md(f_name)
+                t_name_safe = safe_md(t_name) if t_name else "Unknown"
+                t_user_safe = f"@{safe_md(t_user)}" if t_user else "No Username"
+                
+                header_msg = f"🗃️ *Vault Owner:* {f_name_safe}\n" \
+                             f"👤 *TG Name:* {t_name_safe}\n" \
+                             f"🔗 *Username:* {t_user_safe}\n" \
+                             f"🆔 *User ID:* `{target_uid}`\n\n" \
+                             f"*Select User Classification:*"
+            else:
+                header_msg = "🗃️ *Select User Classification:*"
+                
+            await query.edit_message_text(header_msg, reply_markup=get_admin_user_categories_menu(target_uid), parse_mode='Markdown')
+            
+        elif data.startswith('menu_user_folders_'):
+            if user_id != MY_CHAT_ID: return
+            target_uid = int(data.split('_')[3])
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            cursor.execute("SELECT file_name FROM files WHERE file_name LIKE '%%#%%' AND deleted_at IS NULL AND owner_id = %s", (target_uid,))
+            rows = cursor.fetchall()
+            tags = set()
+            for r in rows: tags.update(re.findall(r'#\w+', r[0]))
+            cursor.close()
+            conn.close()
+            keyboard = [[InlineKeyboardButton(t, callback_data=f"p_uh_1_{t[1:]}:{target_uid}")] for t in list(tags)[:14]]
+            keyboard.append([InlineKeyboardButton("⬅️ Back", callback_data=f'menu_user_cats_{target_uid}')])
+            await query.edit_message_text("🗂️ *User's Custom Folders:*", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
 
         elif data.startswith('p_'):
             parts = data.split('_', 3)
@@ -632,7 +820,9 @@ async def handle_text_search(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not is_registered(user_id):
         await update.message.reply_text("⚠️ Please register first by typing:\n`/register Your Name`", parse_mode='Markdown')
         return
-        
+    
+    update_user_tg_info(user_id, update.effective_user.username, update.effective_user.first_name)
+    
     search_query = update.message.text.strip()
     res, has_next, head, target, trash = get_paginated_results('sr', search_query[:30], 1, user_id)
     await update.message.reply_text(text=format_results_msg(res, head, trash), reply_markup=build_pagination_keyboard('sr', search_query[:30], 1, has_next, target), parse_mode='Markdown')
@@ -642,6 +832,8 @@ async def handle_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_registered(user_id):
         await update.message.reply_text("⚠️ Please register first by typing:\n`/register Your Name`", parse_mode='Markdown')
         return
+    
+    update_user_tg_info(user_id, update.effective_user.username, update.effective_user.first_name)
         
     global MEDIA_GROUP_CAPTIONS
     custom_name = update.message.caption
@@ -697,6 +889,7 @@ if __name__ == '__main__':
     app.add_handler(CommandHandler('register', register_cmd))
     app.add_handler(CommandHandler('main', main_menu_command)) 
     app.add_handler(CommandHandler('stats', stats_command))
+    app.add_handler(CommandHandler('broadcast', broadcast))
     app.add_handler(CallbackQueryHandler(button_click))
     
     app.add_handler(MessageHandler(filters.Regex(r'^/share\w+'), share_file))
